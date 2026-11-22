@@ -10,6 +10,13 @@ import datetime
 from typing import Any
 
 from app.seed import SEED_ROWS
+from app.quality_classification import (
+    SOURCE_EVENT_FAILED,
+    SOURCE_EVENT_PASSED,
+)
+
+# 质量监控两类来源事件（统一写法，分类解释收口在 quality_classification）
+_QUALITY_RESULT_EVENT_TYPES = (SOURCE_EVENT_PASSED, SOURCE_EVENT_FAILED)
 
 
 class Store:
@@ -21,6 +28,10 @@ class Store:
         self._events: list[dict[str, Any]] = []
         # 模块快照备份：用于检查点和恢复
         self._snapshots: dict[str, list[dict[str, Any]]] = {}
+        # 湖内质量监控检查回执台账与读取批次（供治理质量统计明细复算）
+        self._quality_receipts: list[dict[str, Any]] = []
+        self._quality_batches: dict[str, dict[str, Any]] = {}
+        self._quality_batch_seq = 0
 
     # ---- 基础读写 ----
 
@@ -85,6 +96,94 @@ class Store:
             e for e in self._events
             if e["source_module"] == source and e["target_module"] == target
         ]
+
+    # ---- 质量检查回执与读取批次 ----
+
+    def append_quality_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """登记一条质量检查回执，返回带稳定回执 id 的副本。
+
+        回执的业务字段（rule_id/passed/actual_value 等）沿用检查产生侧的
+        原有口径，只追加台账定位与交付追踪字段，已有字段保持可按原名读取。
+        """
+        stored = dict(receipt)
+        stored["receipt_id"] = len(self._quality_receipts) + 1
+        stored.setdefault("delivered", False)
+        stored.setdefault("delivered_batch_id", None)
+        self._quality_receipts.append(stored)
+        return stored
+
+    def quality_receipts(self) -> list[dict[str, Any]]:
+        """全部检查回执（写入途中与已交付的都在此处）。"""
+        return list(self._quality_receipts)
+
+    def receipts_for_quality_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        """按批次水位读取同一批检查回执。
+
+        水位为批次打开时已存在的最大质检结果事件 id；读取中断后重试，
+        用同一批次 id 仍取到完全相同的一批回执，迟到检查不会混入。
+        """
+        batch = self._quality_batches.get(batch_id)
+        if batch is None:
+            return []
+        watermark = batch["event_id_watermark"]
+        return [
+            dict(receipt)
+            for receipt in self._quality_receipts
+            if receipt.get("event_id") is not None
+            and receipt["event_id"] <= watermark
+        ]
+
+    def open_quality_batch(self) -> dict[str, Any]:
+        """打开一次治理报告读取批次，以当前质检结果事件 id 作为水位。"""
+        self._quality_batch_seq += 1
+        watermark = max(
+            (
+                int(e["id"])
+                for e in self._events
+                if e.get("source_module") == "quality_monitor"
+                and e.get("event_type") in _QUALITY_RESULT_EVENT_TYPES
+            ),
+            default=0,
+        )
+        batch_id = f"qb-{self._quality_batch_seq:04d}"
+        batch = {
+            "batch_id": batch_id,
+            "opened_at": datetime.datetime.now().isoformat(),
+            "event_id_watermark": watermark,
+            "delivered": False,
+            "delivered_report_id": None,
+            "delivered_at": None,
+        }
+        self._quality_batches[batch_id] = batch
+        return dict(batch)
+
+    def get_quality_batch(self, batch_id: str) -> dict[str, Any] | None:
+        batch = self._quality_batches.get(batch_id)
+        return dict(batch) if batch is not None else None
+
+    def quality_batches(self) -> list[dict[str, Any]]:
+        return [dict(batch) for batch in self._quality_batches.values()]
+
+    def mark_quality_batch_delivered(self, batch_id: str, report_id: int) -> None:
+        """批次随治理报告生成而交付，并把该批回执标记为已交付。
+
+        标记动作可重试：重复交付同一批次结果保持一致，不会把写入途中的
+        新回执计入历史批次。
+        """
+        batch = self._quality_batches.get(batch_id)
+        if batch is None:
+            raise KeyError(f"质量读取批次不存在：{batch_id}")
+        watermark = batch["event_id_watermark"]
+        for receipt in self._quality_receipts:
+            if (
+                receipt.get("event_id") is not None
+                and receipt["event_id"] <= watermark
+            ):
+                receipt["delivered"] = True
+                receipt["delivered_batch_id"] = batch_id
+        batch["delivered"] = True
+        batch["delivered_report_id"] = report_id
+        batch["delivered_at"] = datetime.datetime.now().isoformat()
 
     # ---- 快照与检查点 ----
 

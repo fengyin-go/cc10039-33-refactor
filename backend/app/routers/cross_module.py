@@ -10,6 +10,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.services import service_for, SERVICES
+from app.services.govern_report import GovernReportService
+from app.quality_classification import (
+    CATEGORIES,
+    CATEGORY_FAILED,
+    CATEGORY_PASSED,
+    classify_receipt,
+)
 from app.store import store
 from app.services.partition_policy import PartitionPolicyService
 from app.services.lake_table import LakeTableService
@@ -17,7 +24,6 @@ from app.services.storage_tier import StorageTierService
 from app.services.file_compaction import FileCompactionService
 from app.services.retention_mgr import RetentionMgrService
 from app.services.backfill_job import BackfillJobService
-from app.services.govern_report import GovernReportService
 
 router = APIRouter(prefix="/api/cross", tags=["跨模块编排"])
 
@@ -119,4 +125,69 @@ def pipeline_status() -> dict[str, Any]:
             "has_active_backfills": len(active_backfills) > 0,
             "all_lake_tables_registered": len(registered_tables) == len(lake_tables),
         },
+    }
+
+
+def _receipt_buckets() -> dict[str, list[dict[str, Any]]]:
+    """按统一类别与交付状态整理检查回执，供操作员核对。"""
+    receipts = store.quality_receipts()
+    buckets: dict[str, list[dict[str, Any]]] = {
+        CATEGORY_PASSED: [],
+        CATEGORY_FAILED: [],
+    }
+    for receipt in receipts:
+        buckets[classify_receipt(receipt)].append(receipt)
+    return buckets
+
+
+@router.get("/quality-checks")
+def list_quality_checks() -> dict[str, Any]:
+    """质量检查回执核对视图：哪些事件已交给报表、哪些还在写入途中。
+
+    - delivered=True：已随某个治理报告批次交付；
+    - delivered=False：检查回执已写入，但尚未被任何报告批次读取（写入途中）。
+    类别统一来自共享分类实现，通过/不通过两类与来源事件一一对应。
+    """
+    buckets = _receipt_buckets()
+    delivered = [r for r in store.quality_receipts() if r.get("delivered")]
+    in_flight = [r for r in store.quality_receipts() if not r.get("delivered")]
+    return {
+        "total": len(store.quality_receipts()),
+        "categories": list(CATEGORIES),
+        "by_category": {
+            category: {
+                "total": len(rows),
+                "delivered": sum(1 for r in rows if r.get("delivered")),
+                "in_flight": sum(1 for r in rows if not r.get("delivered")),
+            }
+            for category, rows in buckets.items()
+        },
+        "delivered": delivered,
+        "in_flight": in_flight,
+    }
+
+
+@router.get("/quality-batches")
+def list_quality_batches() -> dict[str, Any]:
+    """列出治理报告的质量读取批次及其固定水位、交付状态。"""
+    batches = store.quality_batches()
+    return {
+        "total": len(batches),
+        "items": batches,
+    }
+
+
+@router.get("/quality-batches/{batch_id}/recompute")
+def recompute_quality_batch(batch_id: str) -> dict[str, Any]:
+    """对指定批次按同一批有明确来源的事件重新复算分类统计与明细。"""
+    if store.get_quality_batch(batch_id) is None:
+        raise HTTPException(status_code=404, detail=f"质量读取批次 {batch_id} 不存在")
+    service = GovernReportService()
+    snapshot = service.read_quality_batch(batch_id)
+    return {
+        "batch": snapshot["batch"],
+        "stats": snapshot["stats"],
+        "event_stats": snapshot["event_stats"],
+        "receipts": snapshot["receipts"],
+        "events": snapshot["events"],
     }

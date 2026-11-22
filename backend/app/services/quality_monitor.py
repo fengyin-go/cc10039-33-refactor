@@ -2,12 +2,22 @@
 
 上游接收入湖管道完成事件，对入湖数据执行质量检查。
 下游联动血缘图谱记录质量问题，再汇总到治理报告中。
+
+检查结果的通过/不通过分类、以及两类来源事件类型的解释，统一收口到
+``app.quality_classification``，本服务只负责产生检查与回执，
+不自行散落分类字面量。
 """
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.quality_classification import (
+    EVENT_TYPE_BY_CATEGORY,
+    QUALITY_MODULE,
+    category_from_passed,
+)
 from app.store import store
 
 
@@ -20,9 +30,6 @@ class QualityMonitorService(BaseModuleService):
     STATUS_ORDER = ["待启用", "已启用", "已停用"]
     ACTION_RULES = {"启用监控": "已启用", "停用监控": "已停用"}
     NEGATIVE_ACTIONS = ["停用监控"]
-
-    # 质量检查结果存储
-    _check_results: list[dict[str, Any]] = []
 
     def enable_monitor(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
         """启用监控规则：验证目标湖表存在。"""
@@ -52,7 +59,13 @@ class QualityMonitorService(BaseModuleService):
         return entry, f"监控规则 {entry.get('规则名称')} 已启用，指标={entry.get('监控指标')}"
 
     def check_quality(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
-        """执行质量检查：对目标湖表数据执行指标检查，命中阈值则触发告警。"""
+        """执行质量检查：对目标湖表数据执行指标检查，命中阈值则触发告警。
+
+        检查产生侧统一走共享分类：
+        1) 先按历史口径写两类来源事件之一（事件类型与 payload 字段不变）；
+        2) 再登记同口径的检查回执（保留原有字段），治理质量统计明细与
+           治理报告均从该回执/事件复算。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, "监控规则不存在"
@@ -74,21 +87,14 @@ class QualityMonitorService(BaseModuleService):
             threshold_value = 0
 
         passed = row_count >= threshold_value
-        result = {
-            "rule_id": entry_id,
-            "rule_name": entry.get("规则名称"),
-            "table_name": table_name,
-            "metric": metric,
-            "threshold": threshold,
-            "actual_value": row_count,
-            "passed": passed,
-            "checked_at": __import__("datetime").datetime.now().isoformat(),
-        }
-        self._check_results.append(result)
+        # 统一分类：类别与来源事件类型都来自共享实现
+        category = category_from_passed(passed)
+        source_event_type = EVENT_TYPE_BY_CATEGORY[category]
+        checked_at = datetime.datetime.now().isoformat()
 
-        # 质量不通过时联动血缘和治理报告
+        # 质量不通过时联动血缘，通过时联动治理报告（沿用历史事件口径）
         if not passed:
-            store.log_event("quality_failed_to_lineage", "quality_monitor", "lineage_graph", {
+            event = store.log_event(source_event_type, QUALITY_MODULE, "lineage_graph", {
                 "rule_id": entry_id,
                 "table_name": table_name,
                 "metric": metric,
@@ -104,17 +110,37 @@ class QualityMonitorService(BaseModuleService):
                 lin["status"] = "待验证"
                 lin["abnormal"] = True
         else:
-            store.log_event("quality_passed_to_govern", "quality_monitor", "govern_report", {
+            event = store.log_event(source_event_type, QUALITY_MODULE, "govern_report", {
                 "rule_id": entry_id,
                 "table_name": table_name,
                 "metric": metric,
                 "actual": row_count,
             })
 
+        # 检查回执：原有字段保持不变，追加台账/分类定位字段
+        receipt = {
+            "rule_id": entry_id,
+            "rule_name": entry.get("规则名称"),
+            "table_name": table_name,
+            "metric": metric,
+            "threshold": threshold,
+            "actual_value": row_count,
+            "passed": passed,
+            "checked_at": checked_at,
+            # 以下为收拢后的统一分类与追踪字段，不改动原有字段
+            "category": category,
+            "source_event_type": source_event_type,
+            "event_id": event["id"],
+        }
+        store.append_quality_receipt(receipt)
+
         return entry, (
-            f"质量检查完成：{metric}={row_count}，阈值={threshold}，"
-            + ("通过" if passed else "不通过")
+            f"质量检查完成：{metric}={row_count}，阈值={threshold}，{category}"
         )
+
+    def list_check_receipts(self) -> list[dict[str, Any]]:
+        """查询湖内质量监控提供的全部检查回执（治理质量统计明细来源）。"""
+        return store.quality_receipts()
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         if action == "启用监控":
